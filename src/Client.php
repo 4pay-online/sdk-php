@@ -27,46 +27,208 @@ use FourPay\Exception\ValidationException;
  *     'amount' => '10.00', 'currency' => 'USD', 'env' => 'test', 'txid' => 'order-1',
  * ]);
  * ```
+ *
+ * Every call has to say which organization it acts in, and there are two ways to
+ * say it. Either pass `organizationId` — the client then sends it as
+ * `x-organization-id` on every call — or set `organizationFromPerimeter` when
+ * your own proxy pins that header for you, and the client adds nothing. An API
+ * key always takes the first way: it is issued together with its
+ * `organizationId`.
+ *
+ * No credential yet, only a login and a password? {@see Client::forLogin()}.
  */
 class Client
 {
     public const VERSION = '0.1.0';
 
+    /** The shared host, which serves every organization and names none of them. */
+    public const DEFAULT_BASE_URL = 'https://4pay.online';
+
     /** Statuses after which nothing more happens on its own. */
     public const FINAL_STATUSES = ['charged', 'rejected', 'failed', 'reversed'];
 
+    private readonly ?string $apiKey;
+    private readonly ?string $organizationId;
+    private ?string $bearerToken;
     private string $baseUrl;
     private string $userAgent;
+    private readonly bool $organizationFromPerimeter;
+
+    /**
+     * Set only inside {@see forLogin()} and read by the constructor.
+     *
+     * A private static flag, and not a constructor parameter, because a
+     * parameter would be part of the public signature: anyone reading it would
+     * find a documented way past the credential check. PHP runs one request in
+     * one process, so the flag cannot be seen half-set by anybody else.
+     */
+    private static bool $buildingLoginClient = false;
 
     /** @var callable|null Injected in tests: fn(array $request): array{status:int, body:string, headers:array} */
     private $transport;
 
     public function __construct(
-        private readonly ?string $apiKey = null,
-        private readonly ?string $organizationId = null,
-        private ?string $bearerToken = null,
-        string $baseUrl = 'https://4pay.online',
+        ?string $apiKey = null,
+        ?string $organizationId = null,
+        ?string $bearerToken = null,
+        string $baseUrl = self::DEFAULT_BASE_URL,
         private readonly float $timeout = 30.0,
         private readonly int $maxRetries = 2,
         ?string $userAgent = null,
         ?callable $transport = null,
+        bool $organizationFromPerimeter = false,
     ) {
-        if ($apiKey === null && $bearerToken === null) {
+        $apiKey = self::trimmed($apiKey);
+        $organizationId = self::trimmed($organizationId);
+        $bearerToken = self::trimmed($bearerToken);
+        $baseUrl = rtrim(self::trimmed($baseUrl) ?? self::DEFAULT_BASE_URL, '/');
+
+        // Whether the proxy in front of $baseUrl pins x-organization-id is a
+        // statement about the caller's deployment, not something the SDK can
+        // see — so the caller makes it and the SDK does not guess.
+        //
+        // It used to guess, by comparing the host against the one default, and
+        // the guess was wrong for every 4pay host but that one: with $baseUrl on
+        // the sandbox, a session token and no organizationId, the client was
+        // built naming no organization and every call it made landed in none.
+        $fromPerimeter = $organizationFromPerimeter;
+        $loginOnly = self::$buildingLoginClient;
+
+        if ($apiKey === null && $bearerToken === null && !$loginOnly) {
             throw new \InvalidArgumentException(
-                'Pass an apiKey (with its organizationId) or a bearerToken — there is no anonymous access.'
+                'Pass an apiKey or a bearerToken — there is no anonymous access. Arriving with a '
+                . 'login and a password instead? Client::forLogin() builds the client that has no '
+                . 'credential yet, and its one purpose is to call createSession().'
             );
         }
         if ($apiKey !== null && $organizationId === null) {
             throw new \InvalidArgumentException(
                 'An API key without organizationId is not a credential: the platform resolves the key '
                 . 'inside the organization named by the x-organization-id header, and refuses the '
-                . 'request before reading the key. Your operator issues both values together.'
+                . 'request before reading the key. Your operator issues both values together. The '
+                . 'other way to name an organization — organizationFromPerimeter, where your own '
+                . 'proxy pins that header — belongs to session tokens; this SDK does not take it in '
+                . 'place of organizationId for a key.'
+            );
+        }
+        // The claim cannot be true on a host we run: none of ours pins the
+        // header, and a client built on the claim would send no organization at
+        // all. Better caught here than as a 400 from the first call, which reads
+        // as our fault.
+        if ($fromPerimeter && self::isSharedHost(self::hostOf($baseUrl))) {
+            throw new \InvalidArgumentException(
+                "organizationFromPerimeter says a proxy in front of {$baseUrl} pins "
+                . 'x-organization-id for one organization, but that host is ours: it serves every '
+                . 'organization and pins nothing. The option is for a domain of your own. On our '
+                . 'hosts, pass organizationId.'
+            );
+        }
+        if ($organizationId === null && !$fromPerimeter && !$loginOnly) {
+            throw new \InvalidArgumentException(
+                'A session token still has to say which organization it acts in, and there are two '
+                . 'ways to say it: pass organizationId, or set organizationFromPerimeter when your '
+                . 'own proxy pins x-organization-id for you. Neither is set, so the call would '
+                . 'reach no organization at all.'
             );
         }
 
-        $this->baseUrl = rtrim($baseUrl, '/');
+        $this->apiKey = $apiKey;
+        $this->organizationId = $organizationId;
+        $this->bearerToken = $bearerToken;
+        $this->baseUrl = $baseUrl;
         $this->userAgent = '4pay-sdk-php/' . self::VERSION . ($userAgent !== null ? " {$userAgent}" : '');
         $this->transport = $transport;
+        $this->organizationFromPerimeter = $fromPerimeter;
+    }
+
+    /**
+     * A client with no credential yet, whose one purpose is to log in.
+     *
+     * ```php
+     * $pay = Client::forLogin(baseUrl: 'https://sandbox.4pay.online');
+     * $session = $pay->createSession('admin@example.com', 'secret', 'admin');
+     * // from here the client carries $session['token'] like any other
+     * ```
+     *
+     * The constructor insists on a credential, and login is exactly where you do
+     * not have one. `$organizationId` is optional here, and only here: admins and
+     * clients live in the platform's own schema and are found without it, and a
+     * partner is searched for across organizations. A `person` is not — see
+     * {@see createSession()}.
+     *
+     * Anything other than {@see createSession()} and {@see health()} throws until
+     * the session token arrives; an unauthenticated call would only come back 401.
+     */
+    public static function forLogin(
+        ?string $organizationId = null,
+        string $baseUrl = self::DEFAULT_BASE_URL,
+        float $timeout = 30.0,
+        int $maxRetries = 2,
+        ?string $userAgent = null,
+        ?callable $transport = null,
+        bool $organizationFromPerimeter = false,
+    ): self {
+        self::$buildingLoginClient = true;
+
+        try {
+            return new self(
+                organizationId: $organizationId,
+                baseUrl: $baseUrl,
+                timeout: $timeout,
+                maxRetries: $maxRetries,
+                userAgent: $userAgent,
+                transport: $transport,
+                organizationFromPerimeter: $organizationFromPerimeter,
+            );
+        } finally {
+            // Cleared even when the constructor throws: a flag left standing
+            // would let the NEXT ordinary client skip the credential check.
+            self::$buildingLoginClient = false;
+        }
+    }
+
+    /**
+     * The host of a base URL — no scheme, no userinfo, no port, no path.
+     *
+     * "Is this a domain of my own?" is a question about the host, and only the
+     * host answers it. A URL that carries the same host with a path, a port or
+     * credentials in front of it is the same host.
+     */
+    private static function hostOf(string $url): string
+    {
+        $host = parse_url(str_contains($url, '//') ? $url : '//' . $url, PHP_URL_HOST);
+        return strtolower((string) $host);
+    }
+
+    /**
+     * Hosts we run ourselves: the apex and everything under it.
+     *
+     * Each serves every organization and names none — the sandbox, the API host
+     * and the payment host included. The check exists to refuse a claim that
+     * cannot be true: `organizationFromPerimeter` says a proxy in front of this
+     * host pins `x-organization-id` for one organization, and in front of ours
+     * nothing pins it.
+     */
+    private static function isSharedHost(string $host): bool
+    {
+        return $host === '4pay.online' || str_ends_with($host, '.4pay.online');
+    }
+
+    /**
+     * Blank is absent.
+     *
+     * A string of spaces is neither a credential nor an organization. Accepting
+     * one would make the constructor's checks a formality and move the failure to
+     * the first HTTP call, where a typo in an environment variable reads as a
+     * platform fault.
+     */
+    private static function trimmed(?string $value): ?string
+    {
+        if ($value === null) {
+            return null;
+        }
+        $trimmed = trim($value);
+        return $trimmed === '' ? null : $trimmed;
     }
 
     /** Is this the end of the road? An unknown status counts as non-final — the safe answer. */
@@ -327,14 +489,31 @@ class Client
     /**
      * Exchange login and password for a session token.
      *
+     * Reachable without a credential through {@see forLogin()}; on a client that
+     * already holds one it simply replaces the session token.
+     *
      * `expire_at` is Unix **seconds** and the field is singular — code written
      * against an `expires_at` ISO string reads `null` and treats the token as
      * immortal.
+     *
+     * A `person` is looked up inside one organization's own schema, so that login
+     * has to name an organization. `admin`, `client` and `partner` do not: the
+     * first two live in the platform's own schema, and a partner is searched for
+     * across organizations.
      *
      * @return array<string, mixed>
      */
     public function createSession(string $login, string $password, string $type = 'partner'): array
     {
+        if ($type === 'person' && $this->organizationId === null && !$this->organizationFromPerimeter) {
+            throw new \InvalidArgumentException(
+                'A person login has to name an organization: the platform looks the person up in '
+                . "that organization's own schema, and with nowhere to look it answers a flat 401 "
+                . 'that reads like a wrong password. Pass an organizationId, or set '
+                . 'organizationFromPerimeter when your own proxy pins x-organization-id for you.'
+            );
+        }
+
         $session = $this->request('POST', '/api/v1/session', [
             'body' => ['type' => $type, 'login' => $login, 'password' => $password],
             'auth' => false,
@@ -353,6 +532,14 @@ class Client
      */
     public function request(string $method, string $path, array $options = []): array
     {
+        if (($options['auth'] ?? true) === true && $this->apiKey === null && $this->bearerToken === null) {
+            throw new \InvalidArgumentException(
+                'This client has no credential yet: Client::forLogin() builds one only to call '
+                . 'createSession(). Call that first — the session token it returns stays on the '
+                . 'client — or build the client with an apiKey or a bearerToken.'
+            );
+        }
+
         $url = $this->baseUrl . $path;
         $query = array_filter(
             $options['query'] ?? [],
@@ -373,9 +560,15 @@ class Client
             if ($this->bearerToken !== null) {
                 $headers[] = 'authorization: Bearer ' . $this->bearerToken;
             }
-            if ($this->organizationId !== null) {
-                $headers[] = 'x-organization-id: ' . $this->organizationId;
-            }
+        }
+        // Outside the auth branch on purpose: this header is not a credential, it
+        // says which organization the call is about, and the unauthenticated calls
+        // need it too. createSession() is the one that matters — a person login is
+        // looked up in that organization's own schema, and without the header the
+        // platform has nowhere to look. Absent means the client runs on its own
+        // domain, where the perimeter supplies it.
+        if ($this->organizationId !== null) {
+            $headers[] = 'x-organization-id: ' . $this->organizationId;
         }
 
         // A write is retried only when it carries an idempotency key. Repeating

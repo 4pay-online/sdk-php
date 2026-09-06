@@ -19,10 +19,16 @@ const CREATED = [
 ];
 
 /**
+ * The transport on its own, for tests where the client is the thing under test.
+ *
+ * stubClient() below wraps it in a keyed client, which is what most tests want.
+ * The tests about how a client comes into being cannot use that — they have to
+ * build their own.
+ *
  * @param callable(int): array{status?: int, body?: array} $handler
- * @return array{0: Client, 1: object}
+ * @return array{0: callable, 1: object}
  */
-function stubClient(callable $handler): array
+function recordingTransport(callable $handler): array
 {
     $recorder = new class {
         /** @var list<array<string, mixed>> */
@@ -44,9 +50,20 @@ function stubClient(callable $handler): array
         ];
     };
 
+    return [$transport, $recorder];
+}
+
+/**
+ * @param callable(int): array{status?: int, body?: array} $handler
+ * @return array{0: Client, 1: object}
+ */
+function stubClient(callable $handler, string $organizationId = 'org-1'): array
+{
+    [$transport, $recorder] = recordingTransport($handler);
+
     $client = new Client(
         apiKey: 'key-1',
-        organizationId: 'org-1',
+        organizationId: $organizationId,
         baseUrl: 'https://sandbox.4pay.online',
         maxRetries: 2,
         transport: $transport,
